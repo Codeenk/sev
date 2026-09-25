@@ -51,10 +51,11 @@ class Meta:
     special_embeddings: bool = False
     weights_dtype: str = "fp32"
     temperature: float = 1.0
+    readout: str = "pointer"   # Sev-X: "judge" runs the generative yes/no readout (no pointer head weights)
     holdout: list = field(default_factory=list)
     extra: dict = field(default_factory=dict)
 
-    KNOWN = ("base", "head", "base_revision", "lora", "head_dim", "option_isolation", "special_embeddings", "weights_dtype", "temperature", "holdout")
+    KNOWN = ("base", "head", "base_revision", "lora", "head_dim", "option_isolation", "special_embeddings", "weights_dtype", "temperature", "readout", "holdout")
 
     @classmethod
     def from_dict(cls, d):
@@ -182,9 +183,13 @@ class Checkpoint:
         """-> (tokenizer, model) in eval mode with the LoRA applied and the pointer head loaded. The model is a
         DecisionModel (torch) or an MLXDecisionModel (backend mlx); both expose the same scoring interface."""
         meta = self.meta
+        if meta.readout == "judge" and self.backend(device, opts) == "mlx":
+            raise ValueError("the judge readout has no MLX backend; serve it with backend=torch")
         tok = load_tokenizer(meta.base, revision=meta.base_revision)
         m = self._load_mlx(tok, opts) if self.backend(device, opts) == "mlx" else self._load_torch(tok, device, opts)
-        m.head.load_state_dict(meta.head); m.eval()
+        if meta.head is not None:
+            m.head.load_state_dict(meta.head)   # judge checkpoints carry no head weights (frozen LM scores)
+        m.eval()
         m.head.temperature = meta.temperature if opts.temperature is None else opts.temperature
         return tok, m
 
@@ -208,7 +213,7 @@ class Checkpoint:
             dtype, merge = torch.bfloat16, False
         merge = merge and not self.adapter_config().get("trainable_token_indices")   # token-trained adapters stay unmerged
         m = DecisionModel(meta.base, tok, device, lora=None, revision=meta.base_revision, head_dim=meta.head_dim,
-                          option_isolation=meta.option_isolation, dtype=dtype, attn=opts.attn)
+                          option_isolation=meta.option_isolation, dtype=dtype, attn=opts.attn, readout=meta.readout)
         m.lm = PeftModel.from_pretrained(m.lm, self.path, torch_device=str(device)).to(device)   # trainable token embeddings, if any, live in the adapter
         if opts.lora_scale != 1:
             for module in m.lm.modules():
@@ -226,7 +231,7 @@ class Checkpoint:
             m.graphs = CudaGraphs(m.lm, m.pad_id)
         return m
 
-    COMPAT_FIELDS = ("base", "base_revision", "lora", "head_dim", "option_isolation", "special_embeddings")
+    COMPAT_FIELDS = ("base", "base_revision", "lora", "head_dim", "option_isolation", "special_embeddings", "readout")
 
     def warm_start(self, model, ours):
         """Delta training: load this checkpoint's adapter and pointer head into `model` (a fresh DecisionModel built with
@@ -246,7 +251,8 @@ class Checkpoint:
         if missing:
             raise ValueError(f"--init_from {self.path} does not cover {len(missing)} of this model's adapter tensors (e.g. {missing[:2]}); check --lora_targets")
         set_peft_model_state_dict(model.lm, weights)
-        model.head.load_state_dict(self.meta.head)
+        if self.meta.head is not None:
+            model.head.load_state_dict(self.meta.head)   # judge checkpoints carry no head weights
         return {"init_from": self.requested, "resolved": self.path, "adapter_sha256": digest(self.file("adapter_model.safetensors")),
                 "head_sha256": digest(self.file("head.pt")), "adapter_tensors": len(weights)}
 

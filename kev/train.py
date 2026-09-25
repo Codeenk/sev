@@ -233,6 +233,7 @@ def parse_args():
     ap.add_argument("--option_isolation", type=int, choices=[0, 1], default=0, help="option spans are isolated sub-branches with shared positions (exact permutation invariance)")
     ap.add_argument("--special_embeddings", type=int, choices=[0, 1], default=0, help="also train the embeddings of the 5 delimiter tokens")
     ap.add_argument("--head_dim", type=int, default=256, help="pointer head dimension")
+    ap.add_argument("--readout", choices=["pointer", "judge"], default="pointer", help="pointer: option-boundary dot-product head (all releases); judge: generative yes/no scoring with the frozen LM head (Sev-X, needs no head weights)")
     ap.add_argument("--lora_targets", choices=["all", "dense", "attn", "qv"], default="all", help="LoRA module set; fewer modules = less drift from the base; dense = all minus the DeltaNet projections on hybrid bases")
     ap.add_argument("--base_revision", default="", help="pin the base commit when the suite manifest does not pin this base")
     ap.add_argument("--p_none", type=float, default=0.1)
@@ -277,11 +278,13 @@ def parse_args():
 
 
 def save_checkpoint(model, tok, meta, out, extra=None):
-    """Persist adapter + head + tokenizer in benchmark-ready layout (used for the final save and snapshots)."""
+    """Persist adapter + head + tokenizer in benchmark-ready layout (used for the final save and snapshots).
+    Judge readouts carry no head weights (the frozen LM scores); meta.head stays None."""
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     model.lm.save_pretrained(out)
-    meta.head, meta.extra = model.head.state_dict(), extra
+    meta.head = None if getattr(model, "readout", "pointer") == "judge" else model.head.state_dict()
+    meta.extra = extra
     write_meta(out, meta)
     tok.save_pretrained(out)
 
@@ -322,13 +325,13 @@ def main():
     tok = load_tokenizer(a.base, revision=revision)
     model = DecisionModel(a.base, tok, dev, lora=a.lora, revision=revision, head_dim=a.head_dim, lora_targets=a.lora_targets,
                           option_isolation=bool(a.option_isolation), special_embeddings=bool(a.special_embeddings),
-                          dtype=torch.bfloat16 if a.weights_dtype == "bf16" else torch.float32)
+                          dtype=torch.bfloat16 if a.weights_dtype == "bf16" else torch.float32, readout=a.readout)
     if a.checkpointing:
         model.lm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.lm.config.use_cache = False
     # what this run will save as head.pt; also the architecture a warm start must match
     meta = Meta(base=a.base, base_revision=revision, lora=a.lora, head_dim=a.head_dim, option_isolation=bool(a.option_isolation),
-                special_embeddings=bool(a.special_embeddings), weights_dtype=a.weights_dtype, holdout=holdout)
+                special_embeddings=bool(a.special_embeddings), weights_dtype=a.weights_dtype, holdout=holdout, readout=a.readout)
     init_source = None
     if a.init_from:
         # delta mode (PR #9, Radexito): start from an already trained adapter + pointer head instead of the base model, so a
@@ -345,14 +348,18 @@ def main():
     print(f"{len(reqs)} training requests (holdout={holdout}), questions by type "
           f"{dict(Counter(q['qtype'] for r in reqs for q in materialize(r)['questions']))}")
 
-    head_params = list(model.head.parameters()); head_ids = {id(p) for p in head_params}
-    groups = [{"params": [p for p in model.trainable_parameters() if id(p) not in head_ids], "lr": a.lr},
-              {"params": head_params, "lr": a.head_lr or a.lr}]
+    if a.readout == "judge":
+        for p in model.head.parameters():
+            p.requires_grad = False   # the pointer head is only a temperature carrier under judge scoring
+    head_params = [p for p in model.head.parameters() if p.requires_grad]; head_ids = {id(p) for p in head_params}
+    groups = [{"params": [p for p in model.trainable_parameters() if id(p) not in head_ids], "lr": a.lr}]
+    if head_params:
+        groups.append({"params": head_params, "lr": a.head_lr or a.lr})
     opt = torch.optim.AdamW(groups, lr=a.lr, weight_decay=a.weight_decay)
     shard0 = reqs[0::WORLD] if DP else reqs   # same shuffle on every rank, so shard sizes are stable across epochs
     micro_per_epoch = math.ceil(len(shard0) / a.batch)
     steps = a.epochs * math.ceil(micro_per_epoch / a.accum)
-    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=[a.lr, a.head_lr or a.lr], total_steps=max(steps, 1), pct_start=0.1)
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=[g.get("lr", a.lr) for g in groups], total_steps=max(steps, 1), pct_start=0.1)
     model.train(); t0 = time.time(); run = Counter(); step = seen = tokens_seen = peak_mem = 0
     for ep in range(a.epochs):
         rng.shuffle(reqs)

@@ -192,6 +192,21 @@ class PointerHead(nn.Module):
         return z if self.training or self.temperature == 1.0 else z / self.temperature
 
 
+# Sev-X judge readout: per-option generative yes/no scoring in the reranker's native format
+# (QwenLM/Qwen3-Embedding's official recipe). The state is the shared document prefix; each option is
+# judged independently, so option order cannot affect an answer by construction (stronger than the
+# attention mask: options never co-attend, not even through <decide>). Training and eval build
+# byte-identical rows, so the prefix cache stays exact.
+JUDGE_INSTRUCT = "Classify whether the document satisfies the requirement"
+JUDGE_PREFIX = '<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be "yes" or "no".<|im_end|>\n<|im_start|>user\n'
+JUDGE_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n \n\n \n\n"
+
+
+def judge_row_text(instr, key, opt):
+    """The query side of one judgment: instruction, question, and the single candidate under judgment."""
+    return "<Instruct>: %s\n<Query>: %s\nCandidate: %s\nOption: %s\n" % (JUDGE_INSTRUCT, instr, key, opt)
+
+
 # What a loaded model exposes to kev.serve, kev.predictors and the Space: the scoring interface both DecisionModel (torch)
 # and kev.mlx_model.MLXDecisionModel implement. tests/test_mlx.py checks the MLX class against this list.
 SCORING_INTERFACE = ("encode", "forward", "probs", "probs_and_prefix", "probs_with_prefix", "probs_batch", "eval",
@@ -206,13 +221,31 @@ def probs_one(model, enc, prefix, keep):
 
 
 class DecisionModel(nn.Module):
-    def __init__(self, name, tok, device, lora=None, revision=None, attn=None, head_dim=256, option_isolation=False, special_embeddings=False, lora_targets="all", dtype=torch.float32):
+    def __init__(self, name, tok, device, lora=None, revision=None, attn=None, head_dim=256, option_isolation=False, special_embeddings=False, lora_targets="all", dtype=torch.float32, readout="pointer"):
         super().__init__()
+        if readout not in ("pointer", "judge"):
+            raise ValueError(f"readout must be pointer or judge, got {readout!r}")
+        self.readout = readout
+        self.tok = tok   # tokenizer for judge-row text (user-escaped like encode); not a parameter, never saved
         # backbone only (no vocab head): we never generate text.
         # eager on MPS/CPU (known-good with our float 4D mask); SDPA on CUDA (accepts arbitrary additive masks).
         attn = attn or ("sdpa" if str(device).startswith("cuda") else "eager")
         # dtype: fp32 for training and exact evaluation; bf16 is a serving option for large backbones (8B on a 32 GB Mac)
-        self.lm = AutoModelForCausalLM.from_pretrained(name, revision=revision, dtype=dtype, attn_implementation=attn).model
+        full = AutoModelForCausalLM.from_pretrained(name, revision=revision, dtype=dtype, attn_implementation=attn)
+        self.lm = full.model
+        if readout == "judge":
+            # frozen pretrained vocabulary projection: the judge scores with the base model's own yes/no
+            # logits, so relevance comes from pretraining, not from a randomly initialised head. Frozen
+            # in backbone dtype; hidden states are cast to float at scoring time, as elsewhere.
+            self.lm_head = full.lm_head
+            for p in self.lm_head.parameters():
+                p.requires_grad = False
+            self._judge_pre = tok(JUDGE_PREFIX, add_special_tokens=False).input_ids
+            self._judge_suf = tok(JUDGE_SUFFIX, add_special_tokens=False).input_ids
+            self._yes_id, self._no_id = tok.convert_tokens_to_ids("yes"), tok.convert_tokens_to_ids("no")
+            if len(tok.encode("yes", add_special_tokens=False)) != 1 or len(tok.encode("no", add_special_tokens=False)) != 1:
+                raise ValueError("judge readout needs single-token yes/no; this tokenizer splits them")
+        del full
         self.pad_id = pad_id(tok)
         # hybrid backbones (Qwen3.5: Gated DeltaNet layers, recurrent) cannot honour the block-causal mask, so every
         # question runs as its own causal row continuing from the state (rows_of). Attention-only backbones keep the
@@ -242,8 +275,11 @@ class DecisionModel(nn.Module):
     def prefix_min_tokens(self):
         """kev.serve caches the state prefix from this many state tokens. Attention-only backbones: 384, below which the
         branch-only pass is not faster than one packed pass on MPS (per-op overhead). Hybrid backbones: always, because
-        their miss path otherwise recomputes the state once per question (Kev-0.8B bf16 on MPS, 5 questions: 1011 -> 413 ms)."""
-        return 0 if self.hybrid else 384
+        their miss path otherwise recomputes the state per question (Kev-0.8B bf16 on MPS, 5 questions: 1011 -> 413 ms).
+        Judge: always, because every option is its own row off the shared state."""
+        if self.hybrid or getattr(self, "readout", "pointer") == "judge":
+            return 0
+        return 384
 
     @property
     def dtype(self):
@@ -251,7 +287,54 @@ class DecisionModel(nn.Module):
 
     def encode(self, tok, rec, **kw):
         """encode() with this model's option-isolation setting; use this from serving/eval code."""
-        return encode(tok, rec, option_isolation=self.option_isolation, **kw)
+        enc = encode(tok, rec, option_isolation=self.option_isolation, **kw)
+        if self.readout == "judge":
+            # per-question query texts for independent judgment scoring (state reuses the encoded prefix).
+            enc["judge"] = [{"instr": q["instr"], "keys": list(q.get("keys") or []),
+                             "options": list(q["options"])} for q in rec["questions"]]
+        return enc
+
+    def _judge_branch(self, instr, key, opt):
+        """Token ids following the shared state prefix for judging one candidate: instruction, question,
+        candidate and the official suffix. User content is escaped exactly like encode()."""
+        return (self._judge_pre + user_tokens(self.tok, judge_row_text(instr, key, opt)) + self._judge_suf)
+
+    def _judge_rows(self, enc):
+        """One causal row per (question, option): shared state prefix + judgment branch. Returns
+        (rows, [(question, n_options)]) with rows as (ids, pos) like rows_of branches."""
+        Ls = enc["seg"].count(0)
+        S, Sp = enc["ids"][:Ls], enc["pos"][:Ls]
+        rows, groups = [], []
+        for q in enc["judge"]:
+            start = len(rows)
+            for k, o in zip(q["keys"] or range(len(q["options"])), q["options"]):
+                br = self._judge_branch(q["instr"], k, o)
+                rows.append((S + br, Sp + list(range(len(S), len(S) + len(br)))))
+            groups.append(len(rows) - start)
+        return rows, groups
+
+    def _judge_logits(self, hiddens, groups):
+        """Yes-logprobs per option from each judgment row's last hidden state, via the frozen head."""
+        out, it = [], iter(hiddens)
+        for k in groups:
+            rows = [next(it) for _ in range(k)]
+            last = torch.stack([h[-1] for h in rows]).float()
+            vocab = F.linear(last, self.lm_head.weight.float(), self.lm_head.bias.float() if self.lm_head.bias is not None else None)
+            yn = vocab.log_softmax(-1)[:, [self._no_id, self._yes_id]]
+            z = yn[:, 1].clone()
+            if not self.training and self.head.temperature != 1.0:
+                z = z / self.head.temperature   # same calibration contract as PointerHead
+            out.append(z)
+        return out
+
+    def forward_judge_batch(self, encs):
+        """List (per record) of lists (per question) of logits, one causal row per option sharing the
+        state prefix. Train and eval build byte-identical rows, so serving prefix reuse stays exact."""
+        out = []
+        for e in encs:
+            rows, groups = self._judge_rows(e)
+            out.append(self._judge_logits(self._rows_hidden(rows), groups))
+        return out
 
     def hidden(self, enc):
         return self.hidden_batch([enc])[0, : len(enc["ids"])]
@@ -338,14 +421,17 @@ class DecisionModel(nn.Module):
         return self.forward_batch([enc])[0]
 
     def forward_batch(self, encs):
-        """List (per record) of lists (per question) of logits. Row form or packed block-causal mask, see rows_form."""
+        """List (per record) of lists (per question) of logits. Row form or packed block-causal mask, see rows_form;
+        the judge readout always runs its independent per-option rows."""
+        if getattr(self, "readout", "pointer") == "judge":
+            return self.forward_judge_batch(encs)
         if self.rows_form(encs): return self.forward_rows_batch(encs)
         hs = self.hidden_batch(encs)
         return [self._readout(hs[b], e) for b, e in enumerate(encs)]
 
     @torch.no_grad()
     def probs(self, enc):
-        return [F.softmax(z, -1).cpu() for z in self.forward(enc)]
+        return [F.softmax(z, -1).cpu() for z in self.forward(enc)]   # forward() dispatches pointer/judge
 
     # --- state-prefix reuse (serving): the state is encoded once, question branches attend to its cached keys/values.
     # Exact by construction: branch tokens never attend to each other across questions (block-causal mask) and the state
@@ -372,6 +458,9 @@ class DecisionModel(nn.Module):
     def probs_and_prefix(self, enc):
         """One full pass that also returns the state prefix (KV cropped to the state, state hidden states): a cache miss
         costs a single forward pass, not two."""
+        if getattr(self, "readout", "pointer") == "judge":
+            Ls, cache, h_state = self.prefix(enc)
+            return self._judge_branch_probs(enc, cache, Ls), (Ls, cache, h_state)
         Ls = enc["seg"].count(0)
         if self.rows_form([enc]):
             # recurrent layers cannot be cropped back to the state (and an over-long packed pass is what the row form avoids),
@@ -386,12 +475,22 @@ class DecisionModel(nn.Module):
         out.past_key_values.crop(-(len(enc["ids"]) - Ls))     # keep the state only (negative = drop that many trailing tokens; positive form deprecated in transformers 5)
         return [F.softmax(z, -1).cpu() for z in self._readout(h, enc)], (Ls, out.past_key_values, h[:Ls].clone())
 
+    def _judge_branch_probs(self, enc, cache, Ls):
+        """Option branches continuing a cached state prefix: same rows as training, state part replaced
+        by the cache (exact: branches never affect the state under a causal mask)."""
+        rows, groups = self._judge_rows(enc)
+        branches = [(ids[Ls:], pos[Ls:]) for ids, pos in rows]
+        hs = self._rows_hidden(branches, cache=cache, prefix_len=Ls)
+        return [F.softmax(z, -1).cpu() for z in self._judge_logits(hs, groups)]
+
     @torch.no_grad()
     def probs_with_prefix(self, enc, prefix):
         """probs() for a record whose state tokens equal the cached prefix's; only the branches run. The cache is cropped
         back to the state afterwards so it can be reused."""
         Ls, cache, h_state = prefix
         if enc["seg"].count(0) != Ls: raise ValueError("prefix does not match this record's state")
+        if getattr(self, "readout", "pointer") == "judge":
+            return self._judge_branch_probs(enc, cache, Ls)
         if self.rows_form([enc]):
             return self._branch_rows_from_prefix(enc, cache)
         ids = torch.tensor([enc["ids"][Ls:]], device=self.device); pos = torch.tensor([enc["pos"][Ls:]], device=self.device)
@@ -411,6 +510,10 @@ class DecisionModel(nn.Module):
         kept, else None). With CUDA graphs the requests the graphed passes admit run together (kev.cuda_graphs: shared
         state and row passes; a state too long for the graphed state pass gets its own eager pass first); the rest, and
         every other backend, one at a time. Rows are independent, so a request's answers do not depend on the batch."""
+        if getattr(self, "readout", "pointer") == "judge":
+            # no graphed form for judgments yet: eager per request through the shared state-prefix path
+            out = [probs_one(self, encs[i], prefixes[i], keep[i]) for i in range(len(encs))]
+            return [o[0] for o in out], [o[1] for o in out]
         splits, pre = [rows_of(e) for e in encs], list(prefixes)   # pre: the cached prefixes plus eager ones made below
         def fits(i, cached):
             S, _, rows = splits[i]
