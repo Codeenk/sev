@@ -252,6 +252,7 @@ def parse_args():
                                                    "(local directory or hub id) instead of starting from the base model; keeps the "
                                                    "released model's in-domain skill while adapting to a new domain")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--snapshot_every", type=int, default=0, help="persist adapter+head+tokenizer under out/snapshots/step-N every N optimizer steps (rank 0); timeout insurance, each snapshot scores directly with kev.benchmark --run")
     a = ap.parse_args()
     if min(a.epochs, a.accum, a.n_per_source, a.lora, a.batch, a.synthetic_repeat) < 1 or not 0 < a.public_frac <= 1:
         ap.error("epochs, accum, n_per_source, lora, batch and synthetic_repeat must be positive; 0 < public_frac <= 1")
@@ -268,9 +269,21 @@ def parse_args():
         ap.error(f"--max_state must be in [{MAX_STATE}, {MAX_TRAIN_STATE}]")
     if a.replay and not (a.data and a.suite):
         ap.error("--replay needs both --data and --suite")
-    if Path(a.out).exists():
-        ap.error("refusing to overwrite an existing run")
+    if a.snapshot_every < 0:
+        ap.error("--snapshot_every must be >= 0")
+    if Path(a.out).exists() and os.environ.get("RANK", "0") == "0":
+        ap.error("refusing to overwrite an existing run")   # ranks > 0 share rank 0's out dir by design
     return a
+
+
+def save_checkpoint(model, tok, meta, out, extra=None):
+    """Persist adapter + head + tokenizer in benchmark-ready layout (used for the final save and snapshots)."""
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    model.lm.save_pretrained(out)
+    meta.head, meta.extra = model.head.state_dict(), extra
+    write_meta(out, meta)
+    tok.save_pretrained(out)
 
 
 def pinned_revision(a, manifest):
@@ -359,15 +372,17 @@ def main():
                 torch.nn.utils.clip_grad_norm_(model.trainable_parameters(), 1.0)
                 opt.step(); sched.step(); opt.zero_grad(); step += 1
                 if dev.split(":")[0] == "mps": empty_cache(dev)   # MPS only: per-step cache release keeps the unified-memory footprint down; on CUDA it would just slow the step
+                if a.snapshot_every and step % a.snapshot_every == 0 and RANK == 0:
+                    save_checkpoint(model, tok, meta, Path(a.out) / "snapshots" / f"step-{step}",
+                                    {"args": vars(a), "suite_sha256": suite_hash, "init_source": init_source, "snapshot_step": step})
+                    print(f"snapshot step-{step} saved", flush=True)
                 if step % 10 == 0 and RANK == 0:
                     print(f"ep{ep} step {step}/{steps} loss {run['ce']/run['n']:.3f} kl {run['kl']/max(run['kl_n'],1):.3f} anchor {run['anchor']/max(run['anchor_n'],1):.3f} {(time.time()-t0)/seen:.3f}s/rec", flush=True)
                     run = Counter()
 
     if RANK == 0:
-        model.lm.save_pretrained(a.out)
-        meta.head, meta.extra = model.head.state_dict(), {"args": vars(a), "suite_sha256": suite_hash, "init_source": init_source}
-        write_meta(a.out, meta)
-        tok.save_pretrained(a.out)
+        save_checkpoint(model, tok, meta, a.out,
+                        {"args": vars(a), "suite_sha256": suite_hash, "init_source": init_source})
         write_json(out_dir / "training_metrics.json", {"wall_seconds": time.time() - t0, "records_seen": seen,
                    "requested_records": a.epochs * len(reqs), "truncated_records": 0, "rejected_records": 0,
                    "optimizer_steps": step, "forward_tokens": tokens_seen, "data_parallel_world": WORLD,
