@@ -4,7 +4,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
-from transformers.cache_utils import LinearAttentionCacheLayerMixin
+try:
+    from transformers.cache_utils import LinearAttentionCacheLayerMixin
+except ImportError:   # older transformers (e.g. a notebook kernel outside the training venv): no hybrid
+    LinearAttentionCacheLayerMixin = ()   # layers exist, so isinstance(x, ()) is always False -- correct here
 
 # Reuse existing rarely-used Qwen special tokens as delimiters (state, q, opt, /opt, decide) so no
 # embedding rows need to be added/trained; LoRA adapts their meaning.
