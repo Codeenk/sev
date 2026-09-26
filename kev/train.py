@@ -465,6 +465,8 @@ def main():
                     run = Counter()
 
     if RANK == 0:
+        wall = time.time() - t0
+        print(f"train-done: {seen} records, {wall:.1f}s wall = {wall / max(seen, 1):.3f}s/rec overall", flush=True)
         save_checkpoint(model, tok, meta, a.out,
                         {"args": vars(a), "suite_sha256": suite_hash, "init_source": init_source})
         write_json(out_dir / "training_metrics.json", {"wall_seconds": time.time() - t0, "records_seen": seen,
