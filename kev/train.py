@@ -167,16 +167,13 @@ class Variant:
         return len(self.enc["ids"]) + (len(self.permuted[0]["ids"]) if self.permuted else 0)
 
 
-JUDGE_KEEP = int(os.environ.get("KEV_JUDGE_KEEP", "8"))            # max options per question in judge TRAINING rows
-JUDGE_ROWTOKENS = int(os.environ.get("KEV_JUDGE_ROWTOKENS", "65536"))  # max (kept rows x state tokens) per record
+JUDGE_KEEP = int(os.environ.get("KEV_JUDGE_KEEP", "8"))            # max options per question in judge TRAINING rows (speed: a 77-option question costs 8 rows, not 78; memory is bounded by checkpointing, not by this)
 
 
-def subsample_judge_options(rec, rng, keep=JUDGE_KEEP, rowtoken_budget=JUDGE_ROWTOKENS):
+def subsample_judge_options(rec, rng, keep=JUDGE_KEEP):
     """Sampled-softmax-style option cap for judge training rows: each question keeps its correct option plus up to
-    keep-1 sampled distractors (labels and keys remapped), so a 77-option banking77 question costs 8 rows, not 78.
-    Prefix-cache training replicates the state KV per row, so uncapped rows scale retained memory as
-    (total options) x (state cache) and OOM at any max_state; this bounds it by construction. Eval is untouched
-    (benchmark encodes full records), so the headline still measures the whole task. Deterministic in `rng`."""
+    keep-1 sampled distractors (labels and keys remapped). Eval is untouched (benchmark encodes full records), so
+    the headline still measures the whole task. Deterministic in `rng`."""
     rec = {**rec, "questions": [dict(q) for q in rec["questions"]]}
     for q in rec["questions"]:
         n = len(q["options"])
@@ -191,24 +188,7 @@ def subsample_judge_options(rec, rng, keep=JUDGE_KEEP, rowtoken_budget=JUDGE_ROW
         if len(old_keys) == n:
             q["keys"] = [picked_keys[i] for i in order]
         q["label"] = order.index(0)
-    # backstop for records with many wide questions: trim sampled distractors, biggest first, never the correct one
-    while sum(len(q["options"]) for q in rec["questions"]) * _judge_state_tokens(rec) > rowtoken_budget:
-        big = max((q for q in rec["questions"] if len(q["options"]) > 2), key=lambda q: len(q["options"]), default=None)
-        if big is None:
-            break
-        drop = max(i for i in range(len(big["options"])) if i != big["label"])
-        del big["options"][drop]
-        if len(big.get("keys") or []) == len(big["options"]) + 1:
-            del big["keys"][drop]
-        if drop < big["label"]:
-            big["label"] -= 1
     return rec
-
-
-def _judge_state_tokens(rec):
-    s = rec.get("state", "")
-    # word count overestimates nothing: tokens run ~1.3x words, so scale up to stay on the safe side of the budget
-    return int(len(s.split()) * 1.5) + 64 if isinstance(s, str) else 512
 
 
 def encode_batch(model, tok, a, chunk, epoch):

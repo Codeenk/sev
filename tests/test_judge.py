@@ -105,6 +105,36 @@ def test_judge_option_cap_keeps_correct_and_remaps():
     for o, k in zip(qa["options"], qa["keys"]):
         assert k == "k" + o[3:]
     rec = {"state": " ".join(["w"] * 200), "questions": [Q(77, i) for i in range(6)]}
-    c = subsample_judge_options(rec, random.Random(3), keep=8, rowtoken_budget=4000)
+    c = subsample_judge_options(rec, random.Random(3), keep=8)
     for i, q in enumerate(c["questions"]):
-        assert q["options"][q["label"]] == f"opt{i}" and len(q["options"]) >= 2
+        assert q["options"][q["label"]] == f"opt{i}" and len(q["options"]) == 8
+
+def test_encode_batch_applies_judge_cap_with_mock_model():
+    """The wiring test: subsample_judge_options is useless if encode_batch never calls it. A mock model (no
+    weights, no GPU) proves the cap runs inside the real encode_batch path for judge and stays off for pointer."""
+    _stub_datasets()
+    import argparse as ap
+    from kev import train as T
+
+    def raw(n_opts, lab=0):
+        return {"state": "some state words here",
+                "_meta": {"id": f"r{n_opts}", "source": "unit"},
+                "questions": {"q0": {"type": "choice", "instructions": "pick",
+                                      "criteria": {f"opt{k}": None for k in range(n_opts)},
+                                      "label": f"opt{lab}", "src": "unit"}}}
+
+    class MockModel:
+        def encode(self, tok, rec, strict=True, **kw):
+            return {"ids": [1] * 10}
+
+    def run(readout):
+        a = ap.Namespace(readout=readout, seed=0, max_state=2048, p_none=0.0, p_none_distract=0.0,
+                         p_distract=0.0, p_none_pair=0.0, perm_kl=0.0, perm_frac=0.0)
+        return T.encode_batch(MockModel(), None, a, [raw(77, 41)], 0)
+
+    (v,) = run("judge")
+    q = v.rec["questions"][0]
+    assert len(q["options"]) == 8, len(q["options"])
+    assert q["options"][q["label"]] == "opt41"
+    (vp,) = run("pointer")
+    assert len(vp.rec["questions"][0]["options"]) == 77

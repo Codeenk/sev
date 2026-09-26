@@ -354,23 +354,44 @@ class DecisionModel(nn.Module):
             out.append(self._judge_logits(hs, groups))
         return out
 
+    JUDGE_CHECKPOINT = os.environ.get("KEV_JUDGE_CHECKPOINT", "1") == "1"  # 0 disables: full branch graphs retained (the v7 OOM)
+    JUDGE_PROFILE = os.environ.get("KEV_JUDGE_PROFILE", "0") == "1"      # log rows/Ls/MB per training phase
+
     def _judge_train_hiddens(self, enc, rows):
         """Prefix-shared training forward (Hydragen pattern): the state runs once with gradients, and
         every option branch continues from a replica of its KV cache in budget chunks. Exact: branches
-        never affect the state under a causal mask, so shared-prefix gradients equal recomputed ones."""
+        never affect the state under a causal mask, so shared-prefix gradients equal recomputed ones.
+        Each branch chunk is gradient-checkpointed (recompute is bit-identical, RNG restored): the replica
+        cache and branch activations are freed after forward, so retained memory is O(state + one chunk) at
+        any option count -- a 78-option question costs one chunk at a time, not 78 caches at once."""
+        from torch.utils import checkpoint as _ckpt
         Ls = enc["seg"].count(0)
         s_ids, s_pos, s_att = self._pad_rows([(enc["ids"][:Ls], enc["pos"][:Ls])])
         out_s = self.lm(input_ids=s_ids, position_ids=s_pos, attention_mask=s_att,
                         past_key_values=DynamicCache(config=self.lm.config), use_cache=True)
         cache = out_s.past_key_values
-        hs, cur, curtok = [], [], 0
+        if self.JUDGE_PROFILE:
+            from .device import allocated_bytes
+            print(f"judge-train: state {Ls} tok, {len(rows)} rows -> {allocated_bytes(self.device) / 2**20:.0f}MB after state forward", flush=True)
+
+        def run_chunk(cur):
+            # checkpoint takes the cache by reference and recreates the replica on recompute; the caller's
+            # prefix is never mutated (replica path), so recompute sees identical inputs.
+            return tuple(self._rows_hidden(cur, cache=cache, prefix_len=Ls))
+
+        hs, cur, curtok, nchunk = [], [], 0, 0
         for ids, pos in rows:
             br = (ids[Ls:], pos[Ls:])
             if cur and curtok + len(br[0]) > self.JUDGE_ROW_BUDGET:
-                hs += self._rows_hidden(cur, cache=cache, prefix_len=Ls); cur, curtok = [], 0
+                hs += list(_ckpt.checkpoint(run_chunk, cur, use_reentrant=False)) if self.JUDGE_CHECKPOINT else list(run_chunk(cur))
+                if self.JUDGE_PROFILE:
+                    from .device import allocated_bytes
+                    nchunk += 1
+                    print(f"judge-train: chunk {nchunk} ({len(cur)} rows) -> {allocated_bytes(self.device) / 2**20:.0f}MB", flush=True)
+                cur, curtok = [], 0
             cur.append(br); curtok += len(br[0])
         if cur:
-            hs += self._rows_hidden(cur, cache=cache, prefix_len=Ls)
+            hs += list(_ckpt.checkpoint(run_chunk, cur, use_reentrant=False)) if self.JUDGE_CHECKPOINT else list(run_chunk(cur))
         return hs
 
     def hidden(self, enc):

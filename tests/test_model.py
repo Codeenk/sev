@@ -205,3 +205,31 @@ def test_init_from_warm_start_and_compatibility_checks(tmp_path):
     assert hb.extra["init_source"]["adapter_sha256"] and read_json(tmp_path / "b/training_config.json")["init_source"]["resolved"] == str(tmp_path / "a")
     bad = subprocess.run(base + ["--out", str(tmp_path / "c"), "--init_from", str(tmp_path / "a"), "--lora", "8"], capture_output=True, text=True, env=env)
     assert bad.returncode != 0 and "lora is 16 there and 8 here" in bad.stderr
+
+
+def test_judge_checkpoint_matches_uncheckpointed_grads_exactly():
+    """The judge training forward checkpoints each branch chunk (replica cache + activations freed, recomputed in
+    backward). Recompute must be bit-identical or training silently learns a different model: gradients with the
+    checkpoint on must equal gradients with it off, exactly. Qwen3 has no dropout, so determinism holds on CPU."""
+    import torch
+    from kev.model import DecisionModel, load_tokenizer
+    tok = load_tokenizer("Qwen/Qwen3-0.6B-Base")
+    m = DecisionModel("Qwen/Qwen3-0.6B-Base", tok, "cpu", readout="judge", dtype=torch.float16)
+    m.train()
+    rec = {"state": "Late and broken.",
+           "questions": [{"instr": "Team?", "options": ["billing: charges", "returns: broken items"],
+                          "label": 1, "keys": ["b", "r"]}]}
+    enc = m.encode(tok, rec)
+
+    def grads():
+        m.zero_grad()
+        out = m.forward_judge_batch([enc])
+        torch.nn.functional.cross_entropy(out[0][0].unsqueeze(0), torch.tensor([1])).backward()
+        return {n: p.grad.float().clone() for n, p in m.named_parameters() if p.grad is not None}
+
+    m.JUDGE_CHECKPOINT = False
+    plain = grads()
+    m.JUDGE_CHECKPOINT = True
+    ckpt = grads()
+    assert plain.keys() == ckpt.keys() and len(plain) > 100
+    assert max((a - b).abs().max().item() for a, b in zip(plain.values(), ckpt.values())) == 0.0
