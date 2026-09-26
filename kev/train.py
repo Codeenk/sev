@@ -272,6 +272,8 @@ def parse_args():
         ap.error("--replay needs both --data and --suite")
     if a.snapshot_every < 0:
         ap.error("--snapshot_every must be >= 0")
+    if a.readout == "judge" and a.checkpointing:
+        ap.error("judge training reuses the state prefix through the KV cache, which gradient checkpointing cannot recompute; drop --checkpointing (peak is lower without it)")
     if Path(a.out).exists() and os.environ.get("RANK", "0") == "0":
         ap.error("refusing to overwrite an existing run")   # ranks > 0 share rank 0's out dir by design
     return a

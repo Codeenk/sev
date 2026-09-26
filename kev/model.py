@@ -341,15 +341,37 @@ class DecisionModel(nn.Module):
         out = []
         for e in encs:
             rows, groups = self._judge_rows(e)
-            hs, cur, curtok = [], [], 0
-            for r in rows:
-                if cur and curtok + len(r[0]) > self.JUDGE_ROW_BUDGET:
-                    hs += self._rows_hidden(cur); cur, curtok = [], 0
-                cur.append(r); curtok += len(r[0])
-            if cur:
-                hs += self._rows_hidden(cur)
+            if self.training:
+                hs = self._judge_train_hiddens(e, rows)
+            else:
+                hs, cur, curtok = [], [], 0
+                for r in rows:
+                    if cur and curtok + len(r[0]) > self.JUDGE_ROW_BUDGET:
+                        hs += self._rows_hidden(cur); cur, curtok = [], 0
+                    cur.append(r); curtok += len(r[0])
+                if cur:
+                    hs += self._rows_hidden(cur)
             out.append(self._judge_logits(hs, groups))
         return out
+
+    def _judge_train_hiddens(self, enc, rows):
+        """Prefix-shared training forward (Hydragen pattern): the state runs once with gradients, and
+        every option branch continues from a replica of its KV cache in budget chunks. Exact: branches
+        never affect the state under a causal mask, so shared-prefix gradients equal recomputed ones."""
+        Ls = enc["seg"].count(0)
+        s_ids, s_pos, s_att = self._pad_rows([(enc["ids"][:Ls], enc["pos"][:Ls])])
+        out_s = self.lm(input_ids=s_ids, position_ids=s_pos, attention_mask=s_att,
+                        past_key_values=DynamicCache(config=self.lm.config), use_cache=True)
+        cache = out_s.past_key_values
+        hs, cur, curtok = [], [], 0
+        for ids, pos in rows:
+            br = (ids[Ls:], pos[Ls:])
+            if cur and curtok + len(br[0]) > self.JUDGE_ROW_BUDGET:
+                hs += self._rows_hidden(cur, cache=cache, prefix_len=Ls); cur, curtok = [], 0
+            cur.append(br); curtok += len(br[0])
+        if cur:
+            hs += self._rows_hidden(cur, cache=cache, prefix_len=Ls)
+        return hs
 
     def hidden(self, enc):
         return self.hidden_batch([enc])[0, : len(enc["ids"])]
