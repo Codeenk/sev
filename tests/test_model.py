@@ -233,3 +233,34 @@ def test_judge_checkpoint_matches_uncheckpointed_grads_exactly():
     ckpt = grads()
     assert plain.keys() == ckpt.keys() and len(plain) > 100
     assert max((a - b).abs().max().item() for a, b in zip(plain.values(), ckpt.values())) == 0.0
+
+
+def test_judge_shared_state_matches_separate_forwards():
+    """Variants of one record (none-pair siblings) share byte-identical states, so training runs one state
+    forward for all of them. Sharing must be invisible: a shared batch gives bitwise-identical logits to
+    separate forwards (deterministic backbone, no dropout), and state-encoder gradients must still arrive
+    through the shared cache (a silent zero there would freeze state learning with no error)."""
+    import torch
+    from kev.model import DecisionModel, load_tokenizer
+    tok = load_tokenizer("Qwen/Qwen3-0.6B-Base")
+    m = DecisionModel("Qwen/Qwen3-0.6B-Base", tok, "cpu", readout="judge", dtype=torch.float16)
+    m.train()
+    base = {"state": "Late and broken.",
+            "questions": [{"instr": "Team?", "options": ["billing: charges", "returns: broken items"],
+                           "label": 1, "keys": ["b", "r"]}]}
+    other = {"state": "Late and broken.",
+             "questions": [{"instr": "Team?", "options": ["billing: charges", "shipping: late box"],
+                            "label": 0, "keys": ["b", "s"]}]}
+    e1, e2 = m.encode(tok, base), m.encode(tok, other)
+    assert tuple(e1["ids"][:e1["seg"].count(0)]) == tuple(e2["ids"][:e2["seg"].count(0)])
+    joint = m.forward_judge_batch([e1, e2])
+    solo1, solo2 = m.forward_judge_batch([e1]), m.forward_judge_batch([e2])
+    for j, s in zip(joint[0][0], solo1[0][0]):
+        assert (j - s).abs().max().item() == 0.0
+    for j, s in zip(joint[1][0], solo2[0][0]):
+        assert (j - s).abs().max().item() == 0.0
+    m.zero_grad()
+    loss = sum(z.sum() for out in joint for z in out)
+    loss.backward()
+    first = dict(m.named_parameters())[next(n for n, p in m.named_parameters() if "layers.0." in n)]
+    assert first.grad is not None and first.grad.abs().max().item() > 0.0
