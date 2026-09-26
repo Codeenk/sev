@@ -116,9 +116,14 @@ def training_requests(a, tok, manifest, holdout):
                   f"({c['max_state']} state / {c['max_branch']} branch / {c['max_packed']} packed tokens)", flush=True)
         reqs = kept
     if a.smoke_worst:
+        _c = training_context(a.max_state)
         def cost(r):
-            e = encode(tok, materialize(r), **training_context(a.max_state))
-            return e["seg"].count(0) * (1 + sum(len(q["options"]) for q in e["judge"]))
+            # The record is the source of truth for the option count: `judge` rows are only built by
+            # DecisionModel.encode, not the module-level encode, and the ranking only needs state tokens + options.
+            rec = materialize(r)
+            e = encode(tok, rec, max_state=_c["max_state"], max_branch=_c["max_branch"])
+            n_opt = sum(len(q["options"]) for q in rec["questions"])
+            return e["seg"].count(0) * (1 + n_opt)
         costs = sorted(((cost(r), r) for r in reqs), key=lambda p: p[0], reverse=True)[:a.smoke_worst]
         reqs = [r for _, r in costs]
         print(f"smoke_worst: {len(reqs)} heaviest records, worst ~{costs[0][0]} row tokens", flush=True)
