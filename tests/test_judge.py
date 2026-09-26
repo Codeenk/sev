@@ -82,3 +82,29 @@ def test_smoke_worst_survives_real_record_shapes(monkeypatch):
     picked = {r["_meta"]["id"] for r in kept}
     # the 9-option record costs ~5x the 2-option one, so it must beat the 400-word state record
     assert "i9_10" in picked, picked
+
+
+def test_judge_option_cap_keeps_correct_and_remaps():
+    """Judge training replicates the state KV per option row, so a 77-option question costs 78 rows and OOMs
+    at any max_state. The cap keeps correct + sampled distractors with remapped labels/keys (eval still scores
+    the full set), deterministically in the rng; the backstop never drops a correct option or a question."""
+    _stub_datasets()
+    import random
+    from kev.train import subsample_judge_options
+
+    def Q(n, lab=0):
+        return {"instr": "pick", "options": [f"opt{i}" for i in range(n)], "label": lab,
+                "keys": [f"k{i}" for i in range(n)], "qid": "q", "qtype": "choice", "src": "u"}
+
+    narrow = subsample_judge_options({"state": "s", "questions": [Q(5, 2)]}, random.Random(0))
+    assert narrow["questions"][0]["label"] == 2 and len(narrow["questions"][0]["options"]) == 5
+    a = subsample_judge_options({"state": "s", "questions": [Q(77, 41)]}, random.Random(7))
+    b = subsample_judge_options({"state": "s", "questions": [Q(77, 41)]}, random.Random(7))
+    qa = a["questions"][0]
+    assert len(qa["options"]) == 8 and qa["options"][qa["label"]] == "opt41" and a == b
+    for o, k in zip(qa["options"], qa["keys"]):
+        assert k == "k" + o[3:]
+    rec = {"state": " ".join(["w"] * 200), "questions": [Q(77, i) for i in range(6)]}
+    c = subsample_judge_options(rec, random.Random(3), keep=8, rowtoken_budget=4000)
+    for i, q in enumerate(c["questions"]):
+        assert q["options"][q["label"]] == f"opt{i}" and len(q["options"]) >= 2

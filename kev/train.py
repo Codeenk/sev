@@ -167,6 +167,50 @@ class Variant:
         return len(self.enc["ids"]) + (len(self.permuted[0]["ids"]) if self.permuted else 0)
 
 
+JUDGE_KEEP = int(os.environ.get("KEV_JUDGE_KEEP", "8"))            # max options per question in judge TRAINING rows
+JUDGE_ROWTOKENS = int(os.environ.get("KEV_JUDGE_ROWTOKENS", "65536"))  # max (kept rows x state tokens) per record
+
+
+def subsample_judge_options(rec, rng, keep=JUDGE_KEEP, rowtoken_budget=JUDGE_ROWTOKENS):
+    """Sampled-softmax-style option cap for judge training rows: each question keeps its correct option plus up to
+    keep-1 sampled distractors (labels and keys remapped), so a 77-option banking77 question costs 8 rows, not 78.
+    Prefix-cache training replicates the state KV per row, so uncapped rows scale retained memory as
+    (total options) x (state cache) and OOM at any max_state; this bounds it by construction. Eval is untouched
+    (benchmark encodes full records), so the headline still measures the whole task. Deterministic in `rng`."""
+    rec = {**rec, "questions": [dict(q) for q in rec["questions"]]}
+    for q in rec["questions"]:
+        n = len(q["options"])
+        if n <= keep:
+            continue
+        old_opts, old_keys = q["options"], q.get("keys") or []
+        others = [(i, o) for i, o in enumerate(old_opts) if i != q["label"]]
+        picked = [(q["label"], old_opts[q["label"]])] + rng.sample(others, keep - 1)  # picked[0] is correct
+        picked_keys = [old_keys[i] if len(old_keys) == n else None for i, _ in picked]
+        order = rng.sample(range(len(picked)), len(picked))
+        q["options"] = [picked[i][1] for i in order]
+        if len(old_keys) == n:
+            q["keys"] = [picked_keys[i] for i in order]
+        q["label"] = order.index(0)
+    # backstop for records with many wide questions: trim sampled distractors, biggest first, never the correct one
+    while sum(len(q["options"]) for q in rec["questions"]) * _judge_state_tokens(rec) > rowtoken_budget:
+        big = max((q for q in rec["questions"] if len(q["options"]) > 2), key=lambda q: len(q["options"]), default=None)
+        if big is None:
+            break
+        drop = max(i for i in range(len(big["options"])) if i != big["label"])
+        del big["options"][drop]
+        if len(big.get("keys") or []) == len(big["options"]) + 1:
+            del big["keys"][drop]
+        if drop < big["label"]:
+            big["label"] -= 1
+    return rec
+
+
+def _judge_state_tokens(rec):
+    s = rec.get("state", "")
+    # word count overestimates nothing: tokens run ~1.3x words, so scale up to stay on the safe side of the budget
+    return int(len(s.split()) * 1.5) + 64 if isinstance(s, str) else 512
+
+
 def encode_batch(model, tok, a, chunk, epoch):
     """Augment each request (fresh permutation / none option / distractor per epoch), optionally add its none-pair
     siblings and a permuted copy for the KL term, and encode strictly."""
@@ -177,8 +221,14 @@ def encode_batch(model, tok, a, chunk, epoch):
         variants = [augment(req, item_rng, p_none=a.p_none, p_none_distract=a.p_none_distract, p_distract=a.p_distract)]
         if a.p_none_pair > 0 and item_rng.random() < a.p_none_pair:
             variants += none_pair(req, item_rng)
-        for v in variants:
+        for vi, v in enumerate(variants):
             rec = materialize(v)
+            if getattr(a, "readout", "pointer") == "judge":
+                # sampled-softmax-style cap BEFORE encoding: the loss reads rec labels, both encodes read rec
+                # options, so capping the record keeps every consumer consistent by construction. Eval never
+                # passes through here, so it always scores the full option set.
+                cap_rng = random.Random(source_seed(a.seed, f"judge-cap:{epoch}:{req['_meta']['id']}:{vi}"))
+                rec = subsample_judge_options(rec, cap_rng)
             enc = model.encode(tok, rec, strict=True, **limits)
             if len(enc["ids"]) > c["max_packed"]:
                 raise ValueError(f"training request exceeds {c['max_packed']} packed tokens")
@@ -290,6 +340,8 @@ def parse_args():
         ap.error("--snapshot_every must be >= 0")
     if a.readout == "judge" and a.checkpointing:
         ap.error("judge training reuses the state prefix through the KV cache, which gradient checkpointing cannot recompute; drop --checkpointing (peak is lower without it)")
+    if a.readout == "judge" and a.anchor_w > 0:
+        ap.error("judge training subsamples options per question, so full-distribution anchor targets do not align; run anchors with the pointer readout")
     if Path(a.out).exists() and os.environ.get("RANK", "0") == "0":
         ap.error("refusing to overwrite an existing run")   # ranks > 0 share rank 0's out dir by design
     return a
