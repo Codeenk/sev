@@ -30,3 +30,21 @@ def test_readout_flag_validated_before_download():
     assert src.index('readout not in ("pointer", "judge")') < src.index("from_pretrained")
     with pytest.raises(ValueError, match="readout must be pointer or judge"):
         DecisionModel("Qwen/Qwen3-0.6B-Base", None, "cpu", readout="bogus")
+
+
+def test_smoke_worst_selects_heaviest_records(monkeypatch):
+    """--smoke_worst must keep the LONGEST records: both v7 OOMs died on the first long record, and a default
+    smoke samples the first (short) ones, so it would certify a config that still dies in the real run."""
+    import argparse as ap
+    train_mod = pytest.importorskip("kev.train", reason="kev.train needs the dataset deps the unit job omits")
+    T = train_mod
+    recs = [{"_meta": {"id": str(i), "source": "synthetic"}, "state": "word " * (10 * (i + 1)),
+             "questions": [{"instr": "pick", "options": ["a", "b"], "label": 0, "keys": ["a", "b"]}]}
+            for i in range(6)]
+    monkeypatch.setattr(T, "load_records", lambda p: recs)
+    a = ap.Namespace(data="x", suite="", replay=0, max_state=4096, seed=0, n_per_source=1000,
+                     train_sources="", public_frac=1.0, synthetic_repeat=1, holdout=0, smoke_worst=2)
+    kept = T.training_requests(a, load_tokenizer("Qwen/Qwen3-0.6B-Base"), None, 0)
+    assert len(kept) == 2
+    lens = [len(r["state"]) for r in kept]
+    assert lens == sorted(lens, reverse=True), lens

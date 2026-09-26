@@ -17,7 +17,7 @@ from .checkpoint import Checkpoint, Meta, write_meta
 from .device import allocated_bytes, default_device, empty_cache
 from .data import EVAL_ONLY, build, augment, load_records, materialize, none_pair, source_seed
 from .suite import SYNTHETIC_SOURCES, digest, load_split, read_json, read_manifest, validate_training, write_json
-from .model import MAX_STATE, MAX_TRAIN_STATE, DecisionModel, fits, load_tokenizer, training_context
+from .model import MAX_STATE, MAX_TRAIN_STATE, DecisionModel, encode, fits, load_tokenizer, training_context
 
 
 # --- losses -----------------------------------------------------------------------------------------------------------
@@ -115,6 +115,13 @@ def training_requests(a, tok, manifest, holdout):
             print(f"dropped {len(reqs) - len(kept)} of {len(reqs)} records that exceed the training context "
                   f"({c['max_state']} state / {c['max_branch']} branch / {c['max_packed']} packed tokens)", flush=True)
         reqs = kept
+    if a.smoke_worst:
+        def cost(r):
+            e = encode(tok, materialize(r), **training_context(a.max_state))
+            return e["seg"].count(0) * (1 + sum(len(q["options"]) for q in e["judge"]))
+        costs = sorted(((cost(r), r) for r in reqs), key=lambda p: p[0], reverse=True)[:a.smoke_worst]
+        reqs = [r for _, r in costs]
+        print(f"smoke_worst: {len(reqs)} heaviest records, worst ~{costs[0][0]} row tokens", flush=True)
     if not reqs:
         raise ValueError("empty training set")
     eval_only = set(EVAL_ONLY) | set(manifest.get("eval_only_sources", []) if manifest else [])
@@ -252,6 +259,10 @@ def parse_args():
     ap.add_argument("--init_from", default="", help="delta mode: warm-start LoRA and the pointer head from an existing run "
                                                    "(local directory or hub id) instead of starting from the base model; keeps the "
                                                    "released model's in-domain skill while adapting to a new domain")
+    ap.add_argument("--smoke_worst", type=int, default=0,
+                    help="keep only the N most expensive surviving records (state tokens + one row per option), "
+                         "longest first: a smoke that samples the first records certifies easy shapes and then the real "
+                         "run OOMs on the first long one. 0 (default) trains on everything.")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--snapshot_every", type=int, default=0, help="persist adapter+head+tokenizer under out/snapshots/step-N every N optimizer steps (rank 0); timeout insurance, each snapshot scores directly with kev.benchmark --run")
     a = ap.parse_args()
