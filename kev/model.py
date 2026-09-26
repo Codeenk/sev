@@ -245,6 +245,12 @@ class DecisionModel(nn.Module):
             self._yes_id, self._no_id = tok.convert_tokens_to_ids("yes"), tok.convert_tokens_to_ids("no")
             if len(tok.encode("yes", add_special_tokens=False)) != 1 or len(tok.encode("no", add_special_tokens=False)) != 1:
                 raise ValueError("judge readout needs single-token yes/no; this tokenizer splits them")
+            # the only two vocabulary rows scoring ever touches, gathered once in fp32: per-call
+            # gathering would transiently materialise a second fp32 head (~600MB at 0.6B)
+            self.register_buffer("_yn_weight", self.lm_head.weight[[self._no_id, self._yes_id]].float())
+            self.register_buffer("_yn_bias",
+                                 self.lm_head.bias[[self._no_id, self._yes_id]].float()
+                                 if self.lm_head.bias is not None else torch.zeros(2))
         del full
         self.pad_id = pad_id(tok)
         # hybrid backbones (Qwen3.5: Gated DeltaNet layers, recurrent) cannot honour the block-causal mask, so every
@@ -313,14 +319,15 @@ class DecisionModel(nn.Module):
             groups.append(len(rows) - start)
         return rows, groups
 
+    JUDGE_ROW_BUDGET = int(os.environ.get("KEV_JUDGE_BUDGET", "4096"))   # max row tokens per training forward: judge rows repeat the state per option, so one record can be ~26k tokens unchunked (the v7 OOM)
+
     def _judge_logits(self, hiddens, groups):
         """Yes-logprobs per option from each judgment row's last hidden state, via the frozen head."""
         out, it = [], iter(hiddens)
         for k in groups:
             rows = [next(it) for _ in range(k)]
             last = torch.stack([h[-1] for h in rows]).float()
-            vocab = F.linear(last, self.lm_head.weight.float(), self.lm_head.bias.float() if self.lm_head.bias is not None else None)
-            yn = vocab.log_softmax(-1)[:, [self._no_id, self._yes_id]]
+            yn = F.linear(last, self._yn_weight, self._yn_bias).log_softmax(-1)
             z = yn[:, 1].clone()
             if not self.training and self.head.temperature != 1.0:
                 z = z / self.head.temperature   # same calibration contract as PointerHead
@@ -329,11 +336,19 @@ class DecisionModel(nn.Module):
 
     def forward_judge_batch(self, encs):
         """List (per record) of lists (per question) of logits, one causal row per option sharing the
-        state prefix. Train and eval build byte-identical rows, so serving prefix reuse stays exact."""
+        state prefix. Train and eval build byte-identical rows, so serving prefix reuse stays exact.
+        Rows run in token-budgeted chunks: rows are independent, so chunked gradients sum exactly."""
         out = []
         for e in encs:
             rows, groups = self._judge_rows(e)
-            out.append(self._judge_logits(self._rows_hidden(rows), groups))
+            hs, cur, curtok = [], [], 0
+            for r in rows:
+                if cur and curtok + len(r[0]) > self.JUDGE_ROW_BUDGET:
+                    hs += self._rows_hidden(cur); cur, curtok = [], 0
+                cur.append(r); curtok += len(r[0])
+            if cur:
+                hs += self._rows_hidden(cur)
+            out.append(self._judge_logits(hs, groups))
         return out
 
     def hidden(self, enc):
