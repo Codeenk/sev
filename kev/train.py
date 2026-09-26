@@ -77,15 +77,25 @@ def accumulation_records(n, batch, accum, microbatch):
     return min(accum * batch, n - start)
 
 
-def sync_grads(model, world):
+def sync_grads(model, world, active=None, backend="nccl"):
     """Average LoRA/head gradients across data-parallel ranks. Manual (not DDP): the forward paths
     (forward_batch/encode) are custom methods, so DDP's __call__ hooks would never fire and ranks would
-    silently diverge. Every trainable parameter is used on every forward, so no unused-param handling."""
+    silently diverge. Every trainable parameter is used on every forward, so no unused-param handling.
+    `active` counts ranks holding a non-empty chunk this microbatch (trailing-shard symmetry: empty ranks
+    contribute exact zeros and are excluded from the divisor; computed identically on every rank, so no
+    extra collective). Under gloo the reduction rides CPU (gloo has no CUDA tensors): exact, ~10ms/42MB."""
     import torch.distributed as dist
+    div = active or world
     for p in model.trainable_parameters():
-        if p.grad is not None:
+        if p.grad is None:
+            continue
+        if backend == "gloo" and p.grad.is_cuda:
+            g = p.grad.cpu()
+            dist.all_reduce(g)
+            p.grad.copy_(g.to(p.grad.device) / div)
+        else:
             dist.all_reduce(p.grad)
-            p.grad /= world
+            p.grad /= div
 
 
 # --- data -------------------------------------------------------------------------------------------------------------
@@ -124,9 +134,9 @@ def training_requests(a, tok, manifest, holdout):
             e = encode(tok, rec, max_state=_c["max_state"], max_branch=_c["max_branch"])
             n_opt = sum(len(q["options"]) for q in rec["questions"])
             return e["seg"].count(0) * (1 + n_opt)
-        costs = sorted(((cost(r), r) for r in reqs), key=lambda p: p[0], reverse=True)[:a.smoke_worst]
-        reqs = [r for _, r in costs]
-        print(f"smoke_worst: {len(reqs)} heaviest records, worst ~{costs[0][0]} row tokens", flush=True)
+        costs = sorted(enumerate(cost(r) for r in reqs), key=lambda p: p[1], reverse=True)[:a.smoke_worst]
+        reqs = [reqs[i] for i, _ in costs]
+        print(f"smoke_worst: {len(reqs)} heaviest records, worst ~{costs[0][1]} row tokens", flush=True)
     if not reqs:
         raise ValueError("empty training set")
     eval_only = set(EVAL_ONLY) | set(manifest.get("eval_only_sources", []) if manifest else [])
@@ -300,6 +310,9 @@ def parse_args():
                          "run OOMs on the first long one. 0 (default) trains on everything.")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--snapshot_every", type=int, default=0, help="persist adapter+head+tokenizer under out/snapshots/step-N every N optimizer steps (rank 0); timeout insurance, each snapshot scores directly with kev.benchmark --run")
+    ap.add_argument("--dist_backend", choices=["nccl", "gloo"], default="nccl",
+                    help="data-parallel reduction backend (CUDA only; CPU always uses gloo). gloo is the fallback "
+                         "where NCCL is broken: exact same averaging, ~10ms per 42MB of LoRA grads.")
     a = ap.parse_args()
     if min(a.epochs, a.accum, a.n_per_source, a.lora, a.batch, a.synthetic_repeat) < 1 or not 0 < a.public_frac <= 1:
         ap.error("epochs, accum, n_per_source, lora, batch and synthetic_repeat must be positive; 0 < public_frac <= 1")
@@ -359,9 +372,12 @@ def main():
     DP = WORLD > 1
     if DP:   # torchrun data-parallel: one process per GPU, gradients averaged by hand (see sync_grads)
         import torch.distributed as dist
-        dist.init_process_group("nccl" if dev == "cuda" else "gloo")
+        backend = a.dist_backend if dev.split(":")[0] == "cuda" else "gloo"
+        if dev.split(":")[0] == "cuda":
+            torch.cuda.set_device(RANK)   # before init: NCCL binds the communicator to the current device
+        dist.init_process_group(backend)
         if dev == "cuda":
-            torch.cuda.set_device(RANK); dev = f"cuda:{RANK}"
+            dev = f"cuda:{RANK}"
     if dev.split(":")[0] == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True; torch.backends.cudnn.allow_tf32 = True
     autocast = torch.autocast("cuda", dtype=torch.bfloat16) if a.dtype == "bf16" else contextlib.nullcontext()
@@ -416,14 +432,25 @@ def main():
         shard = reqs[RANK::WORLD] if DP else reqs
         for mb in range(micro_per_epoch):
             chunk = shard[mb * a.batch : (mb + 1) * a.batch]
-            batch = encode_batch(model, tok, a, chunk, ep)
-            loss, terms = batch_loss(model, a, batch, dev, anchors, anchor_sources, autocast)
-            # weight by source records in the accumulation group so none-pair siblings do not inflate a record's share
-            group_records = accumulation_records(len(shard), a.batch, a.accum, mb) * (len(batch) / len(chunk))
-            (loss / group_records).backward()
+            active = WORLD
             if DP:
-                sync_grads(model, WORLD)
-            run += terms; run["n"] += len(batch); seen += len(batch); tokens_seen += sum(v.tokens for v in batch)
+                # trailing-shard symmetry: a rank whose shard is shorter gets empty chunks at the tail.
+                # It contributes exact zeros and is excluded from the averaging divisor; every rank
+                # computes the same `active` from the same shuffle, so no communication is needed to agree.
+                active = sum(1 for r in range(WORLD) if reqs[r::WORLD][mb * a.batch:(mb + 1) * a.batch])
+            if chunk:
+                batch = encode_batch(model, tok, a, chunk, ep)
+                loss, terms = batch_loss(model, a, batch, dev, anchors, anchor_sources, autocast)
+                # weight by source records in the accumulation group so none-pair siblings do not inflate a record's share
+                group_records = accumulation_records(len(shard), a.batch, a.accum, mb) * (len(batch) / len(chunk))
+                (loss / group_records).backward()
+                run += terms; run["n"] += len(batch); seen += len(batch); tokens_seen += sum(v.tokens for v in batch)
+            elif DP:
+                for p in model.trainable_parameters():
+                    if p.grad is None:
+                        p.grad = torch.zeros_like(p)
+            if DP:
+                sync_grads(model, WORLD, active, backend)
             peak_mem = max(peak_mem, allocated_bytes(dev))
             if (mb + 1) % a.accum == 0 or mb + 1 == micro_per_epoch:
                 torch.nn.utils.clip_grad_norm_(model.trainable_parameters(), 1.0)
