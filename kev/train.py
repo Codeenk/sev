@@ -125,6 +125,8 @@ def training_requests(a, tok, manifest, holdout):
             print(f"dropped {len(reqs) - len(kept)} of {len(reqs)} records that exceed the training context "
                   f"({c['max_state']} state / {c['max_branch']} branch / {c['max_packed']} packed tokens)", flush=True)
         reqs = kept
+    if getattr(a, "smoke_anchor", 0):
+        full_pool = list(reqs)      # before the memory smoke narrows it, so the cheap records are still reachable
     if a.smoke_worst:
         _c = training_context(a.max_state)
         def cost(r):
@@ -137,6 +139,25 @@ def training_requests(a, tok, manifest, holdout):
         costs = sorted(enumerate(cost(r) for r in reqs), key=lambda p: p[1], reverse=True)[:a.smoke_worst]
         reqs = [reqs[i] for i, _ in costs]
         print(f"smoke_worst: {len(reqs)} heaviest records, worst ~{costs[0][1]} row tokens", flush=True)
+    if getattr(a, "smoke_anchor", 0):
+        # A memory smoke ranks records by option count, so every pick is a wide choice question -- exactly
+        # the ones `subsample_judge_options` caps, and a capped question's option set no longer matches the
+        # teacher's, so `anchor_loss` returns None for all of them. That is correct behaviour, but it means a
+        # smoke of N heaviest records certifies memory and never the anchor path. Add the N cheapest records
+        # (narrow questions, which stay under the cap and keep the teacher's key set) so one smoke certifies
+        # memory, loss flow and anchor alignment together.
+        _c = training_context(a.max_state)
+        def cheap(r):
+            rec = materialize(r)
+            n_opt = sum(len(q["options"]) for q in rec["questions"])
+            return n_opt
+        picks = sorted(full_pool, key=cheap)[:a.smoke_anchor]
+        have = {id(r) for r in reqs}
+        extra = [r for r in picks if id(r) not in have]
+        if extra:
+            reqs = reqs + extra
+        print(f"smoke_anchor: +{len(extra)} cheapest records (<={cheap(extra[-1]) if extra else 0} options/record) "
+              f"so the anchor path is exercised too", flush=True)
     if not reqs:
         raise ValueError("empty training set")
     eval_only = set(EVAL_ONLY) | set(manifest.get("eval_only_sources", []) if manifest else [])
@@ -308,6 +329,11 @@ def parse_args():
                     help="keep only the N most expensive surviving records (state tokens + one row per option), "
                          "longest first: a smoke that samples the first records certifies easy shapes and then the real "
                          "run OOMs on the first long one. 0 (default) trains on everything.")
+    ap.add_argument("--smoke_anchor", type=int, default=0,
+                    help="with --smoke_worst, also keep the N cheapest records: the memory smoke picks only wide "
+                         "choice questions, which the option cap truncates, and a truncated option set cannot match "
+                         "the teacher's key set, so anchor_loss skips every one of them (returns None by design). "
+                         "Narrow records keep the teacher's keys and prove the anchor path end to end. 0 (default).")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--snapshot_every", type=int, default=0, help="persist adapter+head+tokenizer under out/snapshots/step-N every N optimizer steps (rank 0); timeout insurance, each snapshot scores directly with kev.benchmark --run")
     ap.add_argument("--dist_backend", choices=["nccl", "gloo"], default="nccl",

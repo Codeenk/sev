@@ -84,6 +84,49 @@ def test_smoke_worst_survives_real_record_shapes(monkeypatch):
     assert "i9_10" in picked, picked
 
 
+def test_smoke_anchor_adds_narrow_records_the_cap_wont_touch(monkeypatch):
+    """--smoke_worst ranks by option count, so it only ever picks wide choice questions -- the only ones
+    subsample_judge_options() truncates, and a truncated option set cannot equal the teacher's key set, so
+    anchor_loss returns None for every one of them (correct, but it means the memory smoke certifies no
+    anchor at all and a gate that watches the anchor column aborts a healthy setup). --smoke_anchor adds the
+    cheapest records, which stay under JUDGE_KEEP and keep the teacher's keys, so one smoke proves memory,
+    loss flow and anchor alignment together."""
+    _stub_datasets()
+    import argparse as ap
+    from kev import train as T
+    from kev.model import load_tokenizer
+
+    def rec(n_opts, sid):
+        return {"state": " ".join(["w"] * 10),
+                "_meta": {"id": sid, "source": "unit"},
+                "questions": {"q0": {"type": "choice", "instructions": "pick one",
+                                      "criteria": {f"opt{k}": None for k in range(n_opts)},
+                                      "label": "opt0", "src": "unit"}}}
+
+    pool = [rec(40, "wide_a"), rec(30, "wide_b"), rec(4, "narrow_a"), rec(3, "narrow_b")]
+    monkeypatch.setattr(T, "load_records", lambda p: pool)
+    tok = load_tokenizer("Qwen/Qwen3-0.6B-Base")
+    monkey_args = dict(data="x", suite="", replay=0, max_state=2048, seed=0, n_per_source=1000,
+                       train_sources="", public_frac=1.0, synthetic_repeat=1, holdout=0)
+    a = ap.Namespace(**monkey_args, smoke_worst=2, smoke_anchor=2)
+    kept = T.training_requests(a, tok, None, 0)
+    picked = {r["_meta"]["id"] for r in kept}
+    assert {"wide_a", "wide_b"} <= picked, picked          # memory: still the heaviest
+    assert {"narrow_a", "narrow_b"} <= picked, picked      # signal: narrow records added
+    # every added record must be under the cap, i.e. its teacher keys survive
+    import random
+    from kev.train import subsample_judge_options, JUDGE_KEEP
+    for r in kept:
+        if r["_meta"]["id"].startswith("narrow"):
+            out = subsample_judge_options(T.materialize(r), random.Random(0))
+            assert len(out["questions"][0]["options"]) <= JUDGE_KEEP
+    # --smoke_anchor only ADDS (it is a complement to the memory smoke, not a filter), so on its own it keeps
+    # the whole pool plus the narrow picks -- here they are already in the pool, so nothing changes.
+    b = ap.Namespace(**monkey_args, smoke_worst=0, smoke_anchor=2)
+    only = {r["_meta"]["id"] for r in T.training_requests(b, tok, None, 0)}
+    assert only == {"wide_a", "wide_b", "narrow_a", "narrow_b"}, only
+
+
 def test_judge_option_cap_keeps_correct_and_remaps():
     """Judge training replicates the state KV per option row, so a 77-option question costs 78 rows and OOMs
     at any max_state. The cap keeps correct + sampled distractors with remapped labels/keys (eval still scores
