@@ -333,8 +333,6 @@ def parse_args():
         ap.error("--snapshot_every must be >= 0")
     if a.readout == "judge" and not a.checkpointing:
         ap.error("judge trains packed option-rows; pass --checkpointing 1 (the v5b recipe): retention is ~0, transients fit")
-    if a.readout == "judge" and a.anchor_w > 0:
-        ap.error("judge training subsamples options per question, so full-distribution anchor targets do not align; run anchors with the pointer readout")
     if Path(a.out).exists() and os.environ.get("RANK", "0") == "0":
         ap.error("refusing to overwrite an existing run")   # ranks > 0 share rank 0's out dir by design
     return a
