@@ -91,7 +91,13 @@ class LoadOptions:
                  trained token embeddings.
     attn         attention backend; None = the model default (SDPA on CUDA, eager elsewhere). "sdpa" on MPS measured
                  parity with eager and is a few percent faster.
-    lora_scale   WiSE-FT-style interpolation between base (0) and fine-tuned weights (1), at inference.
+    int8         quantize the BACKBONE's Linear layers to dynamic int8. CPU only, and deliberately applied to `m.lm`
+                 and NEVER to `m.head`: the pointer head's Linear layers receive 1-D input (one option vector, one
+                 decide vector) and dynamic quantization needs rank >= 2, so quantizing the whole model raises
+                 "The dimension of input tensor should be larger than or equal to 2" on the first forward. The head
+                 is ~0.5M of 600M params, so leaving it fp32 costs nothing in size. KEV_INT8=1. Not applied on CUDA,
+                 where KEV_DTYPE=bf16 already uses native tensor cores.
+        lora_scale   WiSE-FT-style interpolation between base (0) and fine-tuned weights (1), at inference.
     temperature  None = the temperature the checkpoint carries (fitted by scripts/calibrate_checkpoint.py); 1.0 = raw logits.
     backend      None = torch, the path every reported number uses. "mlx" = kev.mlx_model (Metal kernels for the hybrid
                  Qwen3.5 backbones through mlx-lm; the pointer head and encoder are shared; refused for attention-only
@@ -115,13 +121,14 @@ class LoadOptions:
     backend: str | None = None
     cuda_graphs: bool | None = None
     fused: bool | None = None
+    int8: bool = False
 
     BACKENDS = (None, "torch", "mlx", "auto")
 
     @classmethod
     def from_env(cls, env=os.environ):
         """KEV_DTYPE=bf16|fp16|fp32, KEV_MERGE=0, KEV_ATTN=sdpa|eager, KEV_LORA_SCALE, KEV_TEMPERATURE, KEV_BACKEND=torch|mlx|auto,
-        KEV_CUDA_GRAPHS=0|1, KEV_FUSED=0|1.
+        KEV_CUDA_GRAPHS=0|1, KEV_FUSED=0|1, KEV_INT8=1.
         For command-line entry points only; library code passes an explicit LoadOptions. Explicit values that equal a
         library default are kept (fp32 as torch.float32, "torch" as a string) so a caller with its own default, like
         kev.serve, can tell "asked for it" from "did not say"."""
@@ -132,7 +139,8 @@ class LoadOptions:
                    lora_scale=float(env.get("KEV_LORA_SCALE", "1")),
                    temperature=float(env["KEV_TEMPERATURE"]) if env.get("KEV_TEMPERATURE") else None, backend=backend,
                    cuda_graphs={"0": False, "1": True}.get(env.get("KEV_CUDA_GRAPHS", "")),
-                   fused={"0": False, "1": True}.get(env.get("KEV_FUSED", "")))
+                   fused={"0": False, "1": True}.get(env.get("KEV_FUSED", "")),
+                   int8=env.get("KEV_INT8", "") == "1")
 
 
 def mlx_available():
@@ -222,6 +230,17 @@ class Checkpoint:
             m.lora_scale = opts.lora_scale
         if merge: m.lm = m.lm.merge_and_unload()     # W += delta: fp32 math, one rounding (see LoadOptions.merge)
         if dtype != torch.float32: m.lm = m.lm.to(dtype)
+        if opts.int8:
+            # CPU-only, backbone-only, and loud about why. Dynamic quantization needs rank>=2 inputs and the pointer
+            # head's Linear layers see 1-D, so quantizing `m` wholesale dies on the first forward -- which is how this
+            # was found, on Kaggle, after quantize_dynamic had already reported "quantized 198 Linear layers".
+            if str(device).startswith("cuda"):
+                raise ValueError("KEV_INT8 is a CPU path; on CUDA use KEV_DTYPE=bf16 (native tensor cores).")
+            from torch.ao.quantization import quantize_dynamic
+            before = sum(1 for m_ in m.lm.modules() if isinstance(m_, torch.nn.Linear))
+            m.lm = quantize_dynamic(m.lm, {torch.nn.Linear}, dtype=torch.qint8)
+            done = sum(1 for m_ in m.lm.modules() if m_.__class__.__name__ == "Linear")
+            m.int8_backbone = {"quantized": before - done, "left_fp32": done}
         serving = str(device).startswith("cuda") and m.hybrid
         if opts.fused and serving and merge:   # fused projections need the adapter folded in
             from .fused_qwen35 import fuse

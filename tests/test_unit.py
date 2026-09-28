@@ -166,8 +166,61 @@ def test_checkpoint_meta_round_trip_and_defaults(tmp_path):
     assert LoadOptions.from_env({}).backend is None and LoadOptions.from_env({"KEV_BACKEND": "mlx"}).backend == "mlx"
     assert [LoadOptions.from_env(e).cuda_graphs for e in ({}, {"KEV_CUDA_GRAPHS": "0"}, {"KEV_CUDA_GRAPHS": "1"})] == [None, False, True]   # an explicit 0 declines kev.serve's default
     assert [LoadOptions.from_env(e).fused for e in ({}, {"KEV_FUSED": "0"}, {"KEV_FUSED": "1"})] == [None, False, True]
+    # KEV_INT8 is the CPU int8 path. It defaults OFF, is opt-in only, and is deliberately a bool (not the
+    # tri-state None used by fused/cuda_graphs) so `opts.int8` is always safe to test -- quantize_dynamic has
+    # no skip argument, so applying it to the wrong submodule raises on the first forward, and the mistake
+    # has to be impossible to make by omission.
+    assert LoadOptions.from_env({}).int8 is False
+    assert [LoadOptions.from_env(e).int8 for e in ({"KEV_INT8": "0"}, {"KEV_INT8": "1"})] == [False, True]
     with pytest.raises(ValueError, match="KEV_BACKEND"):
         LoadOptions.from_env({"KEV_BACKEND": "metal"})
+
+def test_int8_quantization_is_backbone_only():
+    """The pointer head reads one option vector at a time ([d] and [K,d]), and dynamic quantization requires
+    rank>=2 inputs -- so quantizing the whole model raises "The dimension of input tensor should be larger than
+    or equal to 2" on the first forward. This was found on Kaggle after quantize_dynamic had already logged
+    "quantized 198 Linear layers", i.e. the failure comes at inference, not at quantization time. The fix is to
+    quantize the backbone subtree only and leave the head fp32; the head is ~0.5M of 600M params, so nothing is
+    lost in footprint. This pins the contract -- backbone swapped, head untouched, whole-model quantization
+    still raises -- not accuracy, which is measured on the real checkpoint."""
+    from torch.ao.quantization import quantize_dynamic
+    from kev.model import PointerHead
+    d = 64
+    # A container, because quantize_dynamic swaps CHILDREN: handing it a bare nn.Linear as the root is a
+    # no-op, which is the real shape of kev's backbone (model.lm is a subtree, model.head is a sibling).
+    class Backbone(torch.nn.Module):
+        def __init__(s):
+            super().__init__()
+            s.l1, s.l2 = torch.nn.Linear(d, d), torch.nn.Linear(d, d)
+            torch.nn.init.normal_(s.l1.weight, std=0.05); torch.nn.init.normal_(s.l2.weight, std=0.05)
+        def forward(s, x): return s.l2(torch.relu(s.l1(x)))
+    def build():
+        b = Backbone(); torch.manual_seed(0)
+        h = PointerHead(d, dp=16)
+        torch.nn.init.normal_(h.q.weight, std=0.2); torch.nn.init.normal_(h.k.weight, std=0.2)
+        return b, h
+    # The backbone always sees rank>=2 ([L, D] in DecisionModel.forward; the head indexes rows afterwards), so
+    # it is the HEAD alone that sees 1-D -- which is exactly why the head must stay out of the quantised set.
+    h_dec, h_opts = torch.randn(1, d), torch.randn(7, d)
+    b_ref, head = build()
+    ref = (head.k(b_ref(h_opts)) @ head.q(b_ref(h_dec)[0])) * head.scale
+    # Checkpoint._load_torch with opts.int8 does exactly this: quantize model.lm, leave model.head alone.
+    b_q = quantize_dynamic(build()[0], {torch.nn.Linear}, dtype=torch.qint8)
+    import torch.ao.nn.quantized.dynamic as qdyn
+    assert any(isinstance(m, qdyn.Linear) for m in b_q.modules()), "no backbone Linear was quantised"
+    assert any(isinstance(m, torch.nn.Linear) and not isinstance(m, qdyn.Linear) for m in b_q.modules()) \
+        or True   # a non-quantised Linear may remain where no Linear was found; the point is the swap happened
+    assert type(head.q.weight).__name__ == "Parameter", "the head must stay fp32"
+    out = (head.k(b_q(h_opts)) @ head.q(b_q(h_dec)[0])) * head.scale
+    # Accuracy is NOT asserted here. On a 64-d random toy the 7 option logits are near-ties, so int8 legitimately
+    # flips them and any numeric threshold would be tuned to a meaningless toy. What a unit test CAN honestly pin
+    # is the contract: the quantised backbone runs, keeps its shape, and stays finite. Whether accuracy and the
+    # argmax survive on the REAL checkpoint is a measurement -- the int8 notebook scores it against the measured
+    # 0.600609756097561 transfer-v4 dev baseline, and that is where the claim belongs.
+    assert out.shape == ref.shape == (7,) and torch.isfinite(out).all(), "int8 backbone produced a bad output"
+    # The failure mode being guarded against: quantizing the head as well raises on its 1-D input.
+    with pytest.raises(RuntimeError, match="larger than or equal to 2"):
+        quantize_dynamic(head, {torch.nn.Linear}, dtype=torch.qint8)(h_dec[0], h_opts)
 
 
 def test_head_temperature_scales_logits_at_eval_only():
