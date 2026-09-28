@@ -239,9 +239,16 @@ class Checkpoint:
         loads matching keys silently and a half-loaded adapter still trains and still reports a loss. Returns provenance."""
         from peft import get_peft_model_state_dict, load_peft_weights, set_peft_model_state_dict
         from .suite import digest   # lazy: the Space vendors this module without kev/suite.py
+        skip_head = False
         for name in self.COMPAT_FIELDS:
             theirs, mine = getattr(self.meta, name), getattr(ours, name)
             if theirs != mine and not (name == "base_revision" and None in (theirs, mine)):
+                if name == "readout" and {theirs, mine} == {"pointer", "judge"}:
+                    # cross-readout warm start (Sev-X judge on a distilled pointer backbone and back): the LoRA
+                    # adapter is readout-agnostic, so it transfers exactly; each readout keeps its own head.
+                    print(f"warm start across readouts ({theirs} -> {mine}): adapter only, head skipped", flush=True)
+                    skip_head = True
+                    continue
                 raise ValueError(f"--init_from {self.path}: {name} is {theirs!r} there and {mine!r} here")
         weights = load_peft_weights(self.path, device="cpu")
         have = set(get_peft_model_state_dict(model.lm))
@@ -251,7 +258,7 @@ class Checkpoint:
         if missing:
             raise ValueError(f"--init_from {self.path} does not cover {len(missing)} of this model's adapter tensors (e.g. {missing[:2]}); check --lora_targets")
         set_peft_model_state_dict(model.lm, weights)
-        if self.meta.head is not None:
+        if self.meta.head is not None and not skip_head:
             model.head.load_state_dict(self.meta.head)   # judge checkpoints carry no head weights
         return {"init_from": self.requested, "resolved": self.path, "adapter_sha256": digest(self.file("adapter_model.safetensors")),
                 "head_sha256": digest(self.file("head.pt")), "adapter_tensors": len(weights)}
